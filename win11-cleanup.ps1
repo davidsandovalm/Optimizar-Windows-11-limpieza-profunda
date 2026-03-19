@@ -1,189 +1,366 @@
-<# 
-Win11 25H2 Pro - "LTSC-like" cleanup (SAFE)
-- Removes common preinstalled consumer apps (current user + provisioned)
-- Disables Consumer Experiences, Copilot, Widgets, Chat icon
-- Optionally uninstalls OneDrive
-- Creates a restore point + logs
+#requires -RunAsAdministrator
+<#
+    Optimize-LTSC24H2-SAFE.ps1
+    Windows 11 Enterprise LTSC 24H2 - Safe Profile
 
-Run as Administrator.
+    Objetivo:
+    - Bajar ruido de fondo y mejorar respuesta
+    - Evitar cambios agresivos que puedan desestabilizar el sistema
+    - Crear respaldos antes de tocar nada
+    - NO desactivar por defecto:
+        * Windows Search
+        * Hyper-V / WSL / Sandbox
+        * Bluetooth
+        * Print Spooler
+        * Biometrics
+        * Servicios base de red/audio/GPU/Defender/Windows Update
+
+    Recomendación:
+    - Ejecutarlo solo cuando Windows Update no esté instalando nada
+    - Reiniciar al terminar
 #>
 
-# -----------------------------
-# SETTINGS
-# -----------------------------
-$RemoveOneDrive = $true    # set to $false if you want to keep OneDrive
-$LogPath = "$env:SystemDrive\Win11_Cleanup_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
 
-Start-Transcript -Path $LogPath -Force
+# =========================
+# TOGGLES SEGUROS
+# =========================
+$CreateRestorePoint            = $true
+$ApplyPrivacyTweaks            = $true
+$ApplyVisualTweaks             = $true
+$ApplyWidgetsSuggestions       = $true
+$ApplyBackgroundAppTweaks      = $true
+$ApplyEdgeTweaks               = $true
+$ApplyGameDVRTweaks            = $true
+$ApplyPowerPlanTuning          = $true
+$ApplyConservativeTaskTweaks   = $true
+$ClearTempFiles                = $true
 
-function Assert-Admin {
-  $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-  $p  = New-Object Security.Principal.WindowsPrincipal($id)
-  if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "ERROR: Run PowerShell as Administrator." -ForegroundColor Red
-    Stop-Transcript | Out-Null
-    exit 1
-  }
+# Opcionales conservadores (por defecto en false)
+$SetXboxServicesToManual       = $true    # Manual, NO Disabled
+$SetSysMainToManual            = $false   # Mejor dejarlo false por seguridad
+$RestartExplorerAtEnd          = $false   # Mejor reiniciar Windows manualmente
+$RunDismCleanup                = $false   # Lo dejo OFF por seguridad
+
+# =========================
+# PATHS / LOGS
+# =========================
+$BaseDir    = "C:\LTSC-SAFE-OPT"
+$BackupDir  = Join-Path $BaseDir "backup"
+$ReportDir  = Join-Path $BaseDir "reports"
+$LogFile    = Join-Path $BaseDir ("run-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+$Stamp      = Get-Date -Format "yyyyMMdd-HHmmss"
+
+New-Item -ItemType Directory -Path $BaseDir   -Force | Out-Null
+New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+New-Item -ItemType Directory -Path $ReportDir -Force | Out-Null
+
+function Write-Log {
+    param([string]$Text)
+    $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Text
+    $line | Out-File -FilePath $LogFile -Append -Encoding utf8
+    Write-Host $line
 }
 
-function New-RestorePointSafe {
-  try {
-    Write-Host "Creating restore point..." -ForegroundColor Cyan
-    Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue | Out-Null
-    Checkpoint-Computer -Description "Before Win11 cleanup" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop | Out-Null
-    Write-Host "Restore point created." -ForegroundColor Green
-  } catch {
-    Write-Host "Restore point could not be created (not fatal): $($_.Exception.Message)" -ForegroundColor Yellow
-  }
-}
-
-function Set-RegDword {
-  param(
-    [Parameter(Mandatory=$true)][string]$Path,
-    [Parameter(Mandatory=$true)][string]$Name,
-    [Parameter(Mandatory=$true)][int]$Value
-  )
-  if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
-  New-ItemProperty -Path $Path -Name $Name -PropertyType DWord -Value $Value -Force | Out-Null
-}
-
-function Remove-AppxForAllUsersSafe {
-  param([string]$AppxNameLike)
-
-  $pkgs = Get-AppxPackage -AllUsers | Where-Object { $_.Name -like $AppxNameLike }
-  foreach ($p in $pkgs) {
-    try {
-      Write-Host "Removing (AllUsers Appx): $($p.Name)" -ForegroundColor Cyan
-      Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop
-    } catch {
-      Write-Host "  Could not remove $($p.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+function Ensure-RegistryPath {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) {
+        New-Item -Path $Path -Force | Out-Null
     }
-  }
+}
 
-  $prov = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like $AppxNameLike }
-  foreach ($q in $prov) {
+function Set-RegValue {
+    param(
+        [string]$Path,
+        [string]$Name,
+        [ValidateSet('String','ExpandString','Binary','DWord','MultiString','QWord')]
+        [string]$Type = 'DWord',
+        [object]$Value
+    )
     try {
-      Write-Host "Deprovisioning: $($q.DisplayName)" -ForegroundColor Cyan
-      Remove-AppxProvisionedPackage -Online -PackageName $q.PackageName -ErrorAction Stop | Out-Null
+        Ensure-RegistryPath $Path
+        New-ItemProperty -Path $Path -Name $Name -PropertyType $Type -Value $Value -Force | Out-Null
+        Write-Log "REG OK -> $Path :: $Name = $Value"
     } catch {
-      Write-Host "  Could not deprovision $($q.DisplayName): $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Log "REG FAIL -> $Path :: $Name"
     }
-  }
 }
 
-function Uninstall-OneDriveSafe {
-  if (-not $RemoveOneDrive) { return }
-  Write-Host "Uninstalling OneDrive..." -ForegroundColor Cyan
-
-  try { Stop-Process -Name OneDrive -Force -ErrorAction SilentlyContinue } catch {}
-
-  $od1 = "$env:SystemRoot\System32\OneDriveSetup.exe"
-  $od2 = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
-
-  $exe = $null
-  if (Test-Path $od1) { $exe = $od1 }
-  elseif (Test-Path $od2) { $exe = $od2 }
-
-  if ($exe) {
+function Export-RegSafe {
+    param(
+        [string]$RegistryPath,
+        [string]$OutputFile
+    )
     try {
-      Start-Process -FilePath $exe -ArgumentList "/uninstall" -Wait -ErrorAction Stop
-      Write-Host "OneDrive uninstall launched." -ForegroundColor Green
+        reg export $RegistryPath $OutputFile /y | Out-Null
+        Write-Log "REG BACKUP OK -> $RegistryPath"
     } catch {
-      Write-Host "Could not uninstall OneDrive: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Log "REG BACKUP FAIL -> $RegistryPath"
     }
-  } else {
-    Write-Host "OneDriveSetup.exe not found (skipping)." -ForegroundColor Yellow
-  }
-
-  # Optional: disable OneDrive file storage usage (policy)
-  Set-RegDword -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" -Name "DisableFileSyncNGSC" -Value 1
 }
 
-# -----------------------------
-# MAIN
-# -----------------------------
-Assert-Admin
-New-RestorePointSafe
+function Set-ServiceToManualSafe {
+    param([string]$Name)
 
-Write-Host "Exporting current Appx packages list..." -ForegroundColor Cyan
-Get-AppxPackage -AllUsers | Select-Object Name, PackageFullName | Sort-Object Name | Out-File "$env:SystemDrive\Appx_AllUsers_Before.txt" -Encoding utf8
-Get-AppxProvisionedPackage -Online | Select-Object DisplayName, PackageName | Sort-Object DisplayName | Out-File "$env:SystemDrive\Appx_Provisioned_Before.txt" -Encoding utf8
+    try {
+        $svc = Get-Service -Name $Name -ErrorAction Stop
+        $svc | Select-Object Name, DisplayName, Status, StartType |
+            Export-Csv -Path (Join-Path $BackupDir ("service-$Name-$Stamp.csv")) -NoTypeInformation -Encoding UTF8
 
-# -----------------------------
-# DISABLE "CONSUMER" SURFACE / UI NOISE
-# -----------------------------
-Write-Host "Applying policies (consumer experiences / copilot / widgets / chat)..." -ForegroundColor Cyan
+        Set-Service -Name $Name -StartupType Manual -ErrorAction Stop
+        Write-Log "SERVICE MANUAL -> $Name"
 
-# Turn off Microsoft consumer experiences
-Set-RegDword -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableWindowsConsumerFeatures" -Value 1
-
-# Disable Copilot (policy) + hide button
-Set-RegDword -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" -Name "TurnOffWindowsCopilot" -Value 1
-Set-RegDword -Path "HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" -Name "TurnOffWindowsCopilot" -Value 1
-Set-RegDword -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "ShowCopilotButton" -Value 0
-
-# Disable Widgets (policy)
-Set-RegDword -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Name "AllowWidgets" -Value 0
-
-# Hide Chat icon
-Set-RegDword -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat" -Name "ChatIcon" -Value 3
-
-# -----------------------------
-# REMOVE COMMON PREINSTALLED APPS (SAFE LIST)
-# (keeps Store, App Installer, WebView, Edge, etc.)
-# -----------------------------
-Write-Host "Removing common consumer apps..." -ForegroundColor Cyan
-
-$removeList = @(
-  "Clipchamp.Clipchamp",
-  "Microsoft.549981C3F5F10",              # Cortana (if present)
-  "Microsoft.BingNews",
-  "Microsoft.BingWeather",
-  "Microsoft.BingSports",
-  "Microsoft.BingFinance",
-  "Microsoft.GetHelp",
-  "Microsoft.Getstarted",
-  "Microsoft.MicrosoftSolitaireCollection",
-  "Microsoft.People",
-  "Microsoft.PowerAutomateDesktop",
-  "Microsoft.Todos",
-  "Microsoft.WindowsAlarms",
-  "Microsoft.WindowsFeedbackHub",
-  "Microsoft.WindowsMaps",
-  "Microsoft.WindowsSoundRecorder",
-  "Microsoft.ZuneMusic",
-  "Microsoft.ZuneVideo",
-  "Microsoft.GamingApp",
-  "Microsoft.XboxApp",
-  "Microsoft.XboxGameOverlay",
-  "Microsoft.XboxGamingOverlay",
-  "Microsoft.XboxIdentityProvider",
-  "Microsoft.XboxSpeechToTextOverlay",
-  "Microsoft.YourPhone",                  # Phone Link
-  "Microsoft.MicrosoftOfficeHub",         # "Get Office" hub (you install Office anyway)
-  "MicrosoftTeams",                       # old Teams consumer
-  "MSTeams"                               # new Teams consumer name on some builds
-)
-
-foreach ($name in $removeList) {
-  Remove-AppxForAllUsersSafe -AppxNameLike $name
+        # No lo forzamos a parar si está corriendo en este momento
+    } catch {
+        Write-Log "SERVICE SKIP/FAIL -> $Name"
+    }
 }
 
-# Optional OneDrive uninstall
-Uninstall-OneDriveSafe
+function Disable-TaskSafe {
+    param([string]$TaskPath)
+    try {
+        schtasks /Change /TN $TaskPath /Disable | Out-Null
+        Write-Log "TASK DISABLED -> $TaskPath"
+    } catch {
+        Write-Log "TASK SKIP/FAIL -> $TaskPath"
+    }
+}
 
-# -----------------------------
-# FINAL: restart Explorer and inform restart
-# -----------------------------
-Write-Host "Restarting Explorer..." -ForegroundColor Cyan
+function Remove-TempSafe {
+    param([string]$PathToClean)
+    if (Test-Path $PathToClean) {
+        try {
+            Get-ChildItem -Path $PathToClean -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+            Write-Log "TEMP CLEANED -> $PathToClean"
+        } catch {
+            Write-Log "TEMP CLEAN FAIL -> $PathToClean"
+        }
+    }
+}
+
+function Capture-SystemSnapshot {
+    param([string]$Suffix)
+
+    try {
+        Get-Process |
+            Sort-Object CPU -Descending |
+            Select-Object -First 40 Name, Id, CPU, WS, PM, Handles, StartTime |
+            Export-Csv -Path (Join-Path $ReportDir ("top-processes-$Suffix.csv")) -NoTypeInformation -Encoding UTF8
+        Write-Log "SNAPSHOT OK -> top-processes-$Suffix.csv"
+    } catch {
+        Write-Log "SNAPSHOT FAIL -> processes"
+    }
+
+    try {
+        Get-Service |
+            Sort-Object Status, DisplayName |
+            Select-Object Name, DisplayName, Status, StartType |
+            Export-Csv -Path (Join-Path $ReportDir ("services-$Suffix.csv")) -NoTypeInformation -Encoding UTF8
+        Write-Log "SNAPSHOT OK -> services-$Suffix.csv"
+    } catch {
+        Write-Log "SNAPSHOT FAIL -> services"
+    }
+
+    try {
+        cmd /c "powercfg /getactivescheme" | Out-File -FilePath (Join-Path $ReportDir ("powerplan-$Suffix.txt")) -Encoding utf8
+        Write-Log "SNAPSHOT OK -> powerplan-$Suffix.txt"
+    } catch {
+        Write-Log "SNAPSHOT FAIL -> powerplan"
+    }
+
+    try {
+        Get-CimInstance Win32_OperatingSystem |
+            Select-Object CSName, Caption, Version, BuildNumber, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize |
+            Export-Csv -Path (Join-Path $ReportDir ("os-$Suffix.csv")) -NoTypeInformation -Encoding UTF8
+        Write-Log "SNAPSHOT OK -> os-$Suffix.csv"
+    } catch {
+        Write-Log "SNAPSHOT FAIL -> os"
+    }
+}
+
+function Set-HighPerformancePlanSafe {
+    try {
+        cmd /c "powercfg /setactive SCHEME_MIN" | Out-Null
+        Write-Log "POWER PLAN -> High Performance (SCHEME_MIN)"
+    } catch {
+        Write-Log "POWER PLAN FAIL"
+    }
+}
+
+# =========================
+# PRECHECK
+# =========================
+Write-Log "=== SAFE OPTIMIZER START ==="
+
 try {
-  Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-  Start-Process explorer.exe
+    $os = Get-CimInstance Win32_OperatingSystem
+    Write-Log ("OS -> {0} | Version {1} | Build {2}" -f $os.Caption, $os.Version, $os.BuildNumber)
 } catch {}
 
-Write-Host ""
-Write-Host "DONE. Recommended: RESTART Windows to apply everything." -ForegroundColor Green
-Write-Host "Log saved to: $LogPath" -ForegroundColor Green
-Write-Host "Backups: $env:SystemDrive\Appx_AllUsers_Before.txt and Appx_Provisioned_Before.txt" -ForegroundColor Green
+# Respaldos clave
+Export-RegSafe "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" (Join-Path $BackupDir "HKCU-Explorer-Advanced.reg")
+Export-RegSafe "HKCU\Software\Microsoft\Windows\DWM" (Join-Path $BackupDir "HKCU-DWM.reg")
+Export-RegSafe "HKCU\Software\Microsoft\InputPersonalization" (Join-Path $BackupDir "HKCU-InputPersonalization.reg")
+Export-RegSafe "HKCU\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" (Join-Path $BackupDir "HKCU-AdvertisingInfo.reg")
+Export-RegSafe "HKCU\System\GameConfigStore" (Join-Path $BackupDir "HKCU-GameConfigStore.reg")
+Export-RegSafe "HKCU\Software\Microsoft\Windows\CurrentVersion\GameDVR" (Join-Path $BackupDir "HKCU-GameDVR.reg")
+Export-RegSafe "HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent" (Join-Path $BackupDir "HKLM-CloudContent.reg")
+Export-RegSafe "HKLM\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" (Join-Path $BackupDir "HKLM-AppPrivacy.reg")
+Export-RegSafe "HKLM\SOFTWARE\Policies\Microsoft\Windows\System" (Join-Path $BackupDir "HKLM-System.reg")
+Export-RegSafe "HKLM\SOFTWARE\Policies\Microsoft\Edge" (Join-Path $BackupDir "HKLM-Edge.reg")
+Export-RegSafe "HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR" (Join-Path $BackupDir "HKLM-GameDVR.reg")
 
-Stop-Transcript | Out-Null
+Capture-SystemSnapshot -Suffix "before"
+
+# Punto de restauración
+if ($CreateRestorePoint) {
+    try {
+        Enable-ComputerRestore -Drive "$($env:SystemDrive)\" | Out-Null
+        Checkpoint-Computer -Description "Before LTSC Safe Optimizer" -RestorePointType "MODIFY_SETTINGS" | Out-Null
+        Write-Log "RESTORE POINT -> created"
+    } catch {
+        Write-Log "RESTORE POINT -> skipped/fail"
+    }
+}
+
+# =========================
+# PRIVACY / USER EXPERIENCE
+# =========================
+if ($ApplyPrivacyTweaks) {
+    Write-Log "Applying privacy tweaks..."
+
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" "DWord" 1
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "EnableActivityFeed" "DWord" 0
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "PublishUserActivities" "DWord" 0
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "UploadUserActivities" "DWord" 0
+
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy" "TailoredExperiencesWithDiagnosticDataEnabled" "DWord" 0
+    Set-RegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" "DWord" 1
+    Set-RegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" "DWord" 1
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" "DWord" 0
+}
+
+if ($ApplyWidgetsSuggestions) {
+    Write-Log "Applying widgets and suggestions tweaks..."
+
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" "DWord" 0
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" "DWord" 0
+
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SystemPaneSuggestionsEnabled" "DWord" 0
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SoftLandingEnabled" "DWord" 0
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338388Enabled" "DWord" 0
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-353694Enabled" "DWord" 0
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-353696Enabled" "DWord" 0
+}
+
+if ($ApplyBackgroundAppTweaks) {
+    Write-Log "Applying background apps tweaks..."
+
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" "LetAppsRunInBackground" "DWord" 2
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" "DWord" 1
+}
+
+if ($ApplyEdgeTweaks) {
+    Write-Log "Applying Edge background tweaks..."
+
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "BackgroundModeEnabled" "DWord" 0
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "StartupBoostEnabled" "DWord" 0
+}
+
+if ($ApplyGameDVRTweaks) {
+    Write-Log "Applying Game DVR tweaks..."
+
+    Set-RegValue "HKCU:\System\GameConfigStore" "GameDVR_Enabled" "DWord" 0
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" "DWord" 0
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" "DWord" 0
+}
+
+if ($ApplyVisualTweaks) {
+    Write-Log "Applying visual tweaks..."
+
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting" "DWord" 2
+    Set-RegValue "HKCU:\Control Panel\Desktop" "MenuShowDelay" "String" "0"
+    Set-RegValue "HKCU:\Control Panel\Desktop\WindowMetrics" "MinAnimate" "String" "0"
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAnimations" "DWord" 0
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\DWM" "EnableAeroPeek" "DWord" 0
+}
+
+# =========================
+# SERVICES (CONSERVATIVE)
+# =========================
+if ($SetXboxServicesToManual) {
+    Write-Log "Setting Xbox services to Manual..."
+    Set-ServiceToManualSafe "XblAuthManager"
+    Set-ServiceToManualSafe "XblGameSave"
+    Set-ServiceToManualSafe "XboxNetApiSvc"
+}
+
+if ($SetSysMainToManual) {
+    Write-Log "Setting SysMain to Manual..."
+    Set-ServiceToManualSafe "SysMain"
+}
+
+# =========================
+# TASKS (CONSERVATIVE)
+# =========================
+if ($ApplyConservativeTaskTweaks) {
+    Write-Log "Applying conservative scheduled-task tweaks..."
+
+    $Tasks = @(
+        "\Microsoft\Windows\Customer Experience Improvement Program\Consolidator",
+        "\Microsoft\Windows\Customer Experience Improvement Program\KernelCeipTask",
+        "\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip",
+        "\Microsoft\Windows\Feedback\Siuf\DmClient",
+        "\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload"
+    )
+
+    foreach ($task in $Tasks) {
+        Disable-TaskSafe $task
+    }
+}
+
+# =========================
+# POWER
+# =========================
+if ($ApplyPowerPlanTuning) {
+    Write-Log "Applying power plan..."
+    Set-HighPerformancePlanSafe
+}
+
+# =========================
+# CLEANUP
+# =========================
+if ($ClearTempFiles) {
+    Write-Log "Cleaning temp files..."
+    Remove-TempSafe $env:TEMP
+    Remove-TempSafe "$env:LOCALAPPDATA\Temp"
+    Remove-TempSafe "$env:WINDIR\Temp"
+}
+
+if ($RunDismCleanup) {
+    Write-Log "Running DISM cleanup..."
+    Start-Process -FilePath "dism.exe" -ArgumentList "/Online","/Cleanup-Image","/StartComponentCleanup" -Wait -NoNewWindow
+}
+
+# =========================
+# FINAL SNAPSHOT
+# =========================
+Capture-SystemSnapshot -Suffix "after"
+
+if ($RestartExplorerAtEnd) {
+    try {
+        Write-Log "Restarting Explorer..."
+        Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Process explorer.exe
+    } catch {
+        Write-Log "Explorer restart skipped/fail"
+    }
+}
+
+Write-Log "=== SAFE OPTIMIZER END ==="
+Write-Host ""
+Write-Host "Listo. Reinicia Windows para aplicar los cambios de forma limpia." -ForegroundColor Green
+Write-Host "Logs y respaldos en: $BaseDir" -ForegroundColor Cyan
+Write-Host "Si algo raro pasa, revisa primero: $ReportDir" -ForegroundColor Yellow
